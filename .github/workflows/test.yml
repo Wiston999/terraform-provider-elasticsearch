@@ -1,0 +1,55 @@
+on:
+  push:
+  pull_request:
+name: Test
+jobs:
+  test:
+    strategy:
+      matrix:
+        go-version: [1.15.x]
+        os: [ubuntu-latest]
+        es-version:
+          - 5.6.16
+          - 6.8.9
+          - 7.6.1
+    name: Run ${{ matrix.go-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    steps:
+    - name: Prepare tests
+      run: |
+        sudo apt-get install -y netcat
+        sudo sysctl -w vm.max_map_count=262144
+    - name: Setup Go ${{ matrix.go-version }}
+      uses: actions/setup-go@v1
+      with:
+        go-version: ${{ matrix.go-version }}
+    - name: Checkout code
+      uses: actions/checkout@v2
+    - name: Run Docker containers
+      run: docker-compose up -d
+    - name: Check Docker containers
+      run: docker ps -a
+    - name: Get dependencies
+      run: |
+        go mod vendor
+        curl -sfL https://install.goreleaser.com/github.com/golangci/golangci-lint.sh | bash -s -- -b $GOPATH/bin v1.27.0
+    - name: Wait for Elasticsearch
+      run: |
+        # ensure that ES has come up and is available
+        wget -q --waitretry=1 --retry-connrefused --tries=60 --timeout 60 -O - 9200
+        # Opendistro lazily initializes its indexes, warm it up here :|
+        # https://github.com/opendistro-for-elasticsearch/alerting/issues/60
+        if [ -n "$ES_OPENDISTRO_IMAGE" ]; then
+          wget -q --waitretry=1 --retry-connrefused --tries=60 --timeout 60 -O - 127.0.0.1:9220
+          curl -X POST -H 'Content-type: application/json'  -d '{"name":"_warmup","type":"slack","slack":{"url": "http://www.example.com"}}' http://admin:admin@127.0.0.1:9220/_opendistro/_alerting/destinations
+        fi
+    - name: Run the tests
+      run: |
+        export ELASTICSEARCH_URL=http://127.0.0.1:9200
+        # Linters and checks
+        golangci-lint run --new-from-rev=bf51aaa --verbose --timeout=10m
+        ./script/test-mod-tidy
+        # run tests
+        TF_ACC=1 go test ./... -v -cover
+        # check goreleaser config for deprecations
+        curl -sfL https://git.io/goreleaser | sh -s -- check
